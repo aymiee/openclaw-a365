@@ -3,9 +3,10 @@ import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import type { A365Config, A365MessageMetadata } from "./types.js";
 import { getA365Runtime } from "./runtime.js";
 import { runWithGraphToolContext } from "./graph-tools.js";
-import { resolveA365Credentials } from "./token.js";
+import { resolveA365Credentials, getGraphToken } from "./token.js";
 import { saveConversationReference, type StoredConversationReference } from "./conversation-store.js";
 import { setAdapter, setBlueprintClientId } from "./adapter-store.js";
+import { downloadInboundAttachments, reapStaleAttachmentCache } from "./attachments.js";
 
 export type MonitorA365Opts = {
   cfg: OpenClawConfig;
@@ -154,6 +155,22 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
     storage,
   });
 
+  if (agentApp.adapter) {
+    agentApp.adapter.onTurnError = async (context: any, error: unknown) => {
+      const err = error as Error;
+      const name = err?.name ?? "Error";
+      const message = err?.message ?? String(err);
+      const stack = err?.stack ?? "(no stack)";
+      log.error(`a365 unhandled turn error: ${name}: ${message}\n${stack}`);
+      console.error("[a365 unhandled turn error]", err);
+      try {
+        await context.sendActivity("I hit an error processing your message. Check the container logs.");
+      } catch {
+        // ignore reply failures from the error handler
+      }
+    };
+  }
+
   // Note: We use our own T1/T2/User token flow for Graph API access via token.ts,
   // rather than storing the agentApp reference globally (which would be insecure).
 
@@ -173,11 +190,20 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
     ActivityTypes.Message,
     async (context: any, _state: ApplicationTurnState) => {
       const activity = context.activity;
-      const text = activity.text?.trim();
+      const text = activity.text?.trim() ?? "";
+      const attachments = activity.attachments ?? [];
 
-      if (!text) {
+      if (!text && attachments.length === 0) {
         log.debug("skipping empty message");
         return;
+      }
+
+      if (attachments.length > 0) {
+        log.info("received attachments", {
+          count: attachments.length,
+          types: attachments.map((a: any) => a.contentType),
+          names: attachments.map((a: any) => a.name || "(unnamed)"),
+        });
       }
 
       const metadata = extractMessageMetadata(activity);
@@ -185,6 +211,7 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
         from: metadata.userName || metadata.userId,
         isGroup: metadata.isGroup,
         textLength: text.length,
+        attachmentCount: attachments.length,
       });
 
       // Store conversation reference from this AU-based request for proactive messaging.
@@ -258,6 +285,20 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
             : `a365:group:${conversationId}`;
           const a365To = isDirectMessage ? `user:${senderId}` : `conversation:${conversationId}`;
 
+          let mediaPaths: string[] = [];
+          let mediaTypes: string[] = [];
+          if (attachments.length > 0) {
+            await reapStaleAttachmentCache(log);
+            const agentIdentity = a365Cfg?.agentIdentity || a365Cfg?.owner;
+            const graphToken = agentIdentity ? await getGraphToken(a365Cfg, agentIdentity) : undefined;
+            if (!graphToken) {
+              log.error("no Graph token available for attachment download; check agentIdentity and token config");
+            }
+            const result = await downloadInboundAttachments(context, log, graphToken);
+            mediaPaths = result.mediaPaths;
+            mediaTypes = result.mediaTypes;
+          }
+
           const ctxPayload = core.channel.reply.finalizeInboundContext({
             Body: text,
             RawBody: text,
@@ -270,6 +311,7 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
             ConversationLabel: metadata.userName || senderId,
             SenderName: metadata.userName || senderId,
             SenderId: senderId,
+            ...(mediaPaths.length > 0 ? { MediaPaths: mediaPaths, MediaTypes: mediaTypes } : {}),
             Provider: "a365" as const,
             Surface: "a365" as const,
             MessageSid: metadata.activityId,

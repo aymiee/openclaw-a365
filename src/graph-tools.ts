@@ -760,6 +760,309 @@ async function findMeetingTimes(
   };
 }
 
+type GraphUserIdentity = {
+  id: string;
+  userPrincipalName?: string;
+};
+
+type GraphMailMessage = {
+  id: string;
+  subject?: string;
+  from?: {
+    emailAddress?: {
+      name?: string;
+      address?: string;
+    };
+  };
+  toRecipients?: Array<{
+    emailAddress?: {
+      name?: string;
+      address?: string;
+    };
+  }>;
+  ccRecipients?: Array<{
+    emailAddress?: {
+      name?: string;
+      address?: string;
+    };
+  }>;
+  receivedDateTime?: string;
+  sentDateTime?: string;
+  isRead?: boolean;
+  bodyPreview?: string;
+  body?: {
+    contentType?: string;
+    content?: string;
+  };
+  webLink?: string;
+  hasAttachments?: boolean;
+};
+
+const AAD_OBJECT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const URL_RE = /\bhttps?:\/\/[^\s<>"')]+/gi;
+
+function normalizeUpn(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed || trimmed === "*" || !trimmed.includes("@")) {
+    return undefined;
+  }
+  return trimmed;
+}
+
+function extractInertLinks(text: string | undefined): string[] {
+  if (!text) {
+    return [];
+  }
+  return Array.from(new Set(text.match(URL_RE) ?? []));
+}
+
+async function resolveAllowedMailSenderUpns(cfg: A365Config | undefined): Promise<Set<string>> {
+  const allowed = new Set<string>();
+  for (const entry of cfg?.allowFrom ?? []) {
+    const raw = String(entry).trim();
+    if (!raw || raw === "*") {
+      continue;
+    }
+
+    const upn = normalizeUpn(raw);
+    if (upn) {
+      allowed.add(upn);
+      continue;
+    }
+
+    if (!AAD_OBJECT_ID_RE.test(raw)) {
+      continue;
+    }
+
+    const result = await graphRequest<GraphUserIdentity>(
+      cfg,
+      "GET",
+      `/users/${encodeURIComponent(raw)}?$select=id,userPrincipalName`,
+    );
+    if (result.ok) {
+      const resolvedUpn = normalizeUpn(result.data.userPrincipalName);
+      if (resolvedUpn) {
+        allowed.add(resolvedUpn);
+      }
+    }
+  }
+  return allowed;
+}
+
+function isAllowedMailMessage(message: GraphMailMessage, allowedUpns: Set<string>): boolean {
+  const senderUpn = normalizeUpn(message.from?.emailAddress?.address);
+  return Boolean(senderUpn && allowedUpns.has(senderUpn));
+}
+
+function projectMailMessage(message: GraphMailMessage, includeBody: boolean) {
+  const bodyContent = includeBody ? message.body?.content : undefined;
+  return {
+    id: message.id,
+    subject: message.subject ?? "",
+    from: {
+      name: message.from?.emailAddress?.name,
+      userPrincipalName: message.from?.emailAddress?.address,
+    },
+    to: message.toRecipients?.map((r) => ({
+      name: r.emailAddress?.name,
+      userPrincipalName: r.emailAddress?.address,
+    })) ?? [],
+    cc: message.ccRecipients?.map((r) => ({
+      name: r.emailAddress?.name,
+      userPrincipalName: r.emailAddress?.address,
+    })) ?? [],
+    receivedDateTime: message.receivedDateTime,
+    sentDateTime: message.sentDateTime,
+    isRead: message.isRead,
+    bodyPreview: message.bodyPreview,
+    body: includeBody
+      ? {
+          contentType: message.body?.contentType,
+          content: bodyContent,
+        }
+      : undefined,
+    links: extractInertLinks(`${message.bodyPreview ?? ""}\n${bodyContent ?? ""}`).map((url) => ({
+      url,
+      opened: false,
+    })),
+    webLink: message.webLink,
+    hasAttachments: message.hasAttachments,
+    safety: {
+      senderPolicy: "channels.a365.allowFrom userPrincipalName only",
+      linksOpened: false,
+      attachmentsDownloaded: false,
+    },
+  };
+}
+
+async function listMail(
+  cfg: A365Config | undefined,
+  params: { userId: string; folder?: string; top?: number; unreadOnly?: boolean },
+): Promise<ToolResult> {
+  const allowedUpns = await resolveAllowedMailSenderUpns(cfg);
+  if (allowedUpns.size === 0) {
+    return {
+      content: [{ type: "text", text: JSON.stringify({ messages: [], skippedReason: "No explicit UPNs resolved from channels.a365.allowFrom." }) }],
+    };
+  }
+
+  const folder = params.folder?.trim() || "inbox";
+  const top = Math.max(1, Math.min(params.top ?? 10, 50));
+  const filter = params.unreadOnly ? "&$filter=isRead eq false" : "";
+  const select = "$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,bodyPreview,webLink,hasAttachments";
+  const path = `/users/${encodeURIComponent(params.userId)}/mailFolders/${encodeURIComponent(folder)}/messages?$top=${top}&${select}&$orderby=receivedDateTime desc${filter}`;
+  const result = await graphRequest<{ value: GraphMailMessage[] }>(cfg, "GET", path);
+  if (!result.ok) {
+    return { isError: true, content: [{ type: "text", text: result.error }] };
+  }
+
+  const allowedMessages = result.data.value.filter((message) =>
+    isAllowedMailMessage(message, allowedUpns),
+  );
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(
+          {
+            messages: allowedMessages.map((message) => projectMailMessage(message, false)),
+            skippedCount: result.data.value.length - allowedMessages.length,
+            policy: "Only explicit UPNs resolved from channels.a365.allowFrom are readable.",
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  };
+}
+
+async function getMail(
+  cfg: A365Config | undefined,
+  params: { userId: string; messageId: string; includeBody?: boolean },
+): Promise<ToolResult> {
+  const allowedUpns = await resolveAllowedMailSenderUpns(cfg);
+  if (allowedUpns.size === 0) {
+    return {
+      isError: true,
+      content: [{ type: "text", text: "No explicit UPNs resolved from channels.a365.allowFrom." }],
+    };
+  }
+
+  const select = "$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,bodyPreview,body,webLink,hasAttachments";
+  const path = `/users/${encodeURIComponent(params.userId)}/messages/${encodeURIComponent(params.messageId)}?${select}`;
+  const result = await graphRequest<GraphMailMessage>(cfg, "GET", path);
+  if (!result.ok) {
+    return { isError: true, content: [{ type: "text", text: result.error }] };
+  }
+  if (!isAllowedMailMessage(result.data, allowedUpns)) {
+    return {
+      isError: true,
+      content: [{ type: "text", text: "Message sender is not an explicit UPN resolved from channels.a365.allowFrom." }],
+    };
+  }
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(projectMailMessage(result.data, params.includeBody !== false), null, 2),
+      },
+    ],
+  };
+}
+
+async function searchMail(
+  cfg: A365Config | undefined,
+  params: { userId: string; query: string; top?: number },
+): Promise<ToolResult> {
+  const allowedUpns = await resolveAllowedMailSenderUpns(cfg);
+  if (allowedUpns.size === 0) {
+    return {
+      content: [{ type: "text", text: JSON.stringify({ messages: [], skippedReason: "No explicit UPNs resolved from channels.a365.allowFrom." }) }],
+    };
+  }
+
+  const top = Math.max(1, Math.min(params.top ?? 10, 25));
+  const select = "$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,isRead,bodyPreview,webLink,hasAttachments";
+  const search = encodeURIComponent(`"${params.query.replace(/"/g, '\\"')}"`);
+  const path = `/users/${encodeURIComponent(params.userId)}/messages?$top=${top}&${select}&$search=${search}`;
+  const result = await graphRequest<{ value: GraphMailMessage[] }>(cfg, "GET", path);
+  if (!result.ok) {
+    return { isError: true, content: [{ type: "text", text: result.error }] };
+  }
+
+  const allowedMessages = result.data.value.filter((message) =>
+    isAllowedMailMessage(message, allowedUpns),
+  );
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(
+          {
+            messages: allowedMessages.map((message) => projectMailMessage(message, false)),
+            skippedCount: result.data.value.length - allowedMessages.length,
+            policy: "Only explicit UPNs resolved from channels.a365.allowFrom are readable.",
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+  };
+}
+
+/**
+ * Dormant mail-read tool definitions.
+ *
+ * These are intentionally not returned by createGraphTools yet. They document
+ * the intended safety model for future enablement: read only messages whose
+ * sender UPN exactly matches a UPN resolved from channels.a365.allowFrom. The
+ * wildcard "*" is ignored for mail.
+ */
+export function createDisabledMailReadTools(cfg?: A365Config): AgentTool<TSchema, unknown>[] {
+  return [
+    {
+      name: "list_mail",
+      label: "List Mail",
+      description: "Disabled stub. Lists mailbox messages only from UPNs resolved from channels.a365.allowFrom.",
+      parameters: Type.Object({
+        userId: Type.String({ description: "Mailbox UPN or ID to list mail from" }),
+        folder: Type.Optional(Type.String({ description: "Mail folder name or ID (default: inbox)" })),
+        top: Type.Optional(Type.Number({ description: "Maximum messages to inspect (default: 10, max: 50)" })),
+        unreadOnly: Type.Optional(Type.Boolean({ description: "Only inspect unread messages" })),
+      }),
+      execute: async (_toolCallId, params) => listMail(cfg, params as Parameters<typeof listMail>[1]),
+    },
+    {
+      name: "get_mail",
+      label: "Get Mail",
+      description: "Disabled stub. Reads one message only if its sender UPN is resolved from channels.a365.allowFrom.",
+      parameters: Type.Object({
+        userId: Type.String({ description: "Mailbox UPN or ID" }),
+        messageId: Type.String({ description: "Graph message ID" }),
+        includeBody: Type.Optional(Type.Boolean({ description: "Include message body without opening links" })),
+      }),
+      execute: async (_toolCallId, params) => getMail(cfg, params as Parameters<typeof getMail>[1]),
+    },
+    {
+      name: "search_mail",
+      label: "Search Mail",
+      description: "Disabled stub. Searches mail but returns only messages from UPNs resolved from channels.a365.allowFrom.",
+      parameters: Type.Object({
+        userId: Type.String({ description: "Mailbox UPN or ID" }),
+        query: Type.String({ description: "Mailbox search query" }),
+        top: Type.Optional(Type.Number({ description: "Maximum messages to inspect (default: 10, max: 25)" })),
+      }),
+      execute: async (_toolCallId, params) => searchMail(cfg, params as Parameters<typeof searchMail>[1]),
+    },
+  ];
+}
+
 /**
  * Create the Graph API tools for the A365 channel.
  *
