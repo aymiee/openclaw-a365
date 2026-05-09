@@ -1,9 +1,10 @@
-import type { OpenClawConfig, RuntimeEnv } from "openclaw/plugin-sdk";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
 import type { A365Config, A365MessageMetadata } from "./types.js";
 import { getA365Runtime } from "./runtime.js";
 import { runWithGraphToolContext } from "./graph-tools.js";
 import { resolveA365Credentials } from "./token.js";
-import { saveConversationReference } from "./conversation-store.js";
+import { saveConversationReference, type StoredConversationReference } from "./conversation-store.js";
 import { setAdapter, setBlueprintClientId } from "./adapter-store.js";
 
 export type MonitorA365Opts = {
@@ -61,18 +62,23 @@ export function extractMessageMetadata(activity: ActivityForMetadata): A365Messa
  */
 export function buildConversationReference(activity: ActivityForMetadata): StoredConversationReference {
   return {
-    conversationId: activity.conversation?.id || "",
+    user: {
+      id: activity.from?.id || "",
+      name: activity.from?.name,
+      aadObjectId: activity.from?.aadObjectId,
+    },
+    agent: {
+      id: activity.recipient?.id || "",
+      name: activity.recipient?.name,
+    },
+    conversation: {
+      id: activity.conversation?.id || "",
+      isGroup: activity.conversation?.isGroup || false,
+      tenantId: activity.conversation?.tenantId || activity.channelData?.tenant?.id,
+    },
     serviceUrl: activity.serviceUrl || "",
     channelId: activity.channelId || "msteams",
-    botId: activity.recipient?.id || "",
-    botName: activity.recipient?.name,
-    userId: activity.from?.id || "",
-    userName: activity.from?.name,
-    userAadId: activity.from?.aadObjectId,
-    tenantId: activity.conversation?.tenantId || activity.channelData?.tenant?.id,
-    isGroup: activity.conversation?.isGroup || false,
     locale: activity.locale,
-    updatedAt: Date.now(),
   };
 }
 
@@ -138,7 +144,7 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
   const { ActivityTypes } = await import("@microsoft/agents-activity");
 
   // Create custom turn state type
-  type ApplicationTurnState = typeof TurnState;
+  type ApplicationTurnState = any;
 
   // Create the Agent Application
   // Note: We use our own T1/T2/User token flow for Graph API access,
@@ -152,7 +158,7 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
   // rather than storing the agentApp reference globally (which would be insecure).
 
   // Handle welcome message (configurable via welcomeMessage setting)
-  agentApp.onConversationUpdate("membersAdded", async (context: typeof TurnContext) => {
+  agentApp.onConversationUpdate("membersAdded", async (context: any) => {
     log.debug("members added event");
     const welcomeMessage = a365Cfg?.welcomeMessage;
     // Only send if welcomeMessage is configured and not empty
@@ -165,7 +171,7 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
   // Handle all messages
   agentApp.onActivity(
     ActivityTypes.Message,
-    async (context: typeof TurnContext, _state: ApplicationTurnState) => {
+    async (context: any, _state: ApplicationTurnState) => {
       const activity = context.activity;
       const text = activity.text?.trim();
 
@@ -241,7 +247,7 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
             cfg,
             channel: "a365",
             peer: {
-              kind: isDirectMessage ? "dm" : "group",
+              kind: isDirectMessage ? "direct" : "group",
               id: isDirectMessage ? senderId : conversationId,
             },
           });
@@ -348,7 +354,7 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
             const { queuedFinal, counts } = await core.channel.reply.dispatchReplyFromConfig({
               ctx: ctxPayload,
               cfg,
-              dispatcher,
+              dispatcher: dispatcher as any,
               replyOptions,
             });
 
@@ -356,7 +362,7 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
             // The Agents SDK context is only valid during the handler
             await Promise.all(pendingSends);
 
-            log.info("dispatch complete", { queuedFinal, textCount: counts?.text ?? 0, repliesSent: replyCount });
+            log.info("dispatch complete", { queuedFinal, textCount: (counts as any)?.text ?? 0, repliesSent: replyCount });
 
             // Update the main session's lastChannel/lastTo for cron delivery support.
             try {
@@ -410,7 +416,7 @@ export async function monitorA365Provider(opts: MonitorA365Opts): Promise<Monito
 
   // startServer returns a promise that resolves when server is ready
   // It uses PORT env var for the port
-  const serverPromise = startServer(agentApp);
+  const serverPromise = startServer(agentApp as any);
 
   log.info(`a365 provider started on port ${port}`);
 

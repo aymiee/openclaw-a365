@@ -1,4 +1,3 @@
-import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk";
 import type { A365Config, A365MessageMetadata } from "./types.js";
 import { getA365Runtime } from "./runtime.js";
 import { getAdapter, getBlueprintClientId } from "./adapter-store.js";
@@ -194,7 +193,7 @@ function normalizeA365Target(to: string | undefined): string | undefined {
 /**
  * A365 outbound adapter for sending messages.
  */
-export const a365Outbound: ChannelOutboundAdapter = {
+export const a365Outbound: any = {
   deliveryMode: "direct",
   textChunkLimit: 4000,
 

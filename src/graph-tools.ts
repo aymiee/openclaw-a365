@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { Type, type TSchema } from "@sinclair/typebox";
+import { Type, type TSchema } from "typebox";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { A365Config, GraphCalendarEvent } from "./types.js";
 import { getGraphToken } from "./token.js";
@@ -93,7 +93,7 @@ async function graphRequest<T>(
   method: string,
   path: string,
   body?: unknown,
-): Promise<{ ok: true; data: T } | { ok: false; error: string; status?: number }> {
+): Promise<any> {
   const log = getLogger();
 
   // Get the username for token acquisition
@@ -159,7 +159,7 @@ async function graphRequest<T>(
 /**
  * Validate common tool parameters.
  */
-function validateUserId(userId: string): { ok: true } | { ok: false; error: string } {
+function validateUserId(userId: string): any {
   if (!userId || !userId.trim()) {
     return { ok: false, error: "userId is required and cannot be empty" };
   }
@@ -173,7 +173,7 @@ function validateUserId(userId: string): { ok: true } | { ok: false; error: stri
 /**
  * Validate ISO datetime string format.
  */
-function validateIsoDateTime(dateTime: string, fieldName: string): { ok: true } | { ok: false; error: string } {
+function validateIsoDateTime(dateTime: string, fieldName: string): any {
   if (!dateTime || !dateTime.trim()) {
     return { ok: false, error: `${fieldName} is required` };
   }
@@ -187,7 +187,7 @@ function validateIsoDateTime(dateTime: string, fieldName: string): { ok: true } 
 /**
  * Validate email addresses in an array.
  */
-function validateEmails(emails: string[], fieldName: string): { ok: true } | { ok: false; error: string } {
+function validateEmails(emails: string[], fieldName: string): any {
   for (const email of emails) {
     if (!email.includes("@")) {
       return { ok: false, error: `Invalid email address in ${fieldName}: ${email}` };
@@ -196,7 +196,7 @@ function validateEmails(emails: string[], fieldName: string): { ok: true } | { o
   return { ok: true };
 }
 
-type ToolResult = AgentToolResult<unknown>;
+type ToolResult = any;
 
 // --- GIF dedup ring buffer (module-level, in-memory) ---
 const RECENT_GIF_MAX = 20;
