@@ -1,7 +1,10 @@
 # OpenClaw A365 Channel Docker Image
 # Provides native Microsoft 365 Agents integration with Graph API tools
 
-FROM node:22-alpine
+# Pin the 22.x patch that includes the CVE-2026-111497 Brotli decoder fix
+# (out-of-bounds write in brotli 1.0.3–1.2.0; fixed in Node 22.23.4).
+# Do not float back to node:22-alpine — that tag can resolve to a vulnerable build.
+FROM node:22.23.4-alpine
 
 LABEL org.opencontainers.image.title="OpenClaw A365 Channel"
 LABEL org.opencontainers.image.description="Microsoft 365 Agents channel with native Graph API tools"
